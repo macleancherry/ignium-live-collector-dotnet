@@ -256,7 +256,10 @@ public class Collector
                 for (int i = 0; i < _cachedSessionInfo.DriverInfo.Drivers.Count; i++)
                 {
                     var driver = _cachedSessionInfo.DriverInfo.Drivers[i];
-                    _driverCache[i] = driver;
+                    if (driver.CarIdx >= 0)
+                    {
+                        _driverCache[driver.CarIdx] = driver;
+                    }
                 }
             }
 
