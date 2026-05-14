@@ -1,8 +1,10 @@
 using System.Globalization;
 using System.IO;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using irsdkSharp;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
@@ -294,11 +296,13 @@ public class Collector
 
             _lastSessionInfoYaml = sessionInfoYaml;
 
-            _cachedSessionInfo = _yamlDeserializer.Deserialize<SessionInfo>(sessionInfoYaml);
+            var sanitizedYaml = SanitizeSessionInfoYaml(sessionInfoYaml);
+
+            _cachedSessionInfo = _yamlDeserializer.Deserialize<SessionInfo>(sanitizedYaml);
             if (_cachedSessionInfo?.DriverInfo?.Drivers == null || _cachedSessionInfo.DriverInfo.Drivers.Count == 0)
             {
                 // Some SDK payloads are wrapped in a top-level SessionInfo node.
-                var wrapped = _yamlDeserializer.Deserialize<SessionInfoEnvelope>(sessionInfoYaml);
+                var wrapped = _yamlDeserializer.Deserialize<SessionInfoEnvelope>(sanitizedYaml);
                 if (wrapped?.SessionInfo != null)
                 {
                     _cachedSessionInfo = wrapped.SessionInfo;
@@ -326,7 +330,7 @@ public class Collector
 
             if (_driverCache.Count == 0)
             {
-                TryPopulateDriverCacheFromYamlTree(sessionInfoYaml);
+                TryPopulateDriverCacheFromYamlTree(sanitizedYaml);
             }
 
             Console.WriteLine("[collector] updated session info with {0} drivers", _driverCache.Count);
@@ -339,6 +343,12 @@ public class Collector
 
     private string TryReadSessionInfoYaml()
     {
+        var byReflection = TryReadSessionInfoViaSdkAccessors();
+        if (!string.IsNullOrWhiteSpace(byReflection))
+        {
+            return byReflection;
+        }
+
         var sessionInfoString = TryReadTelemetryString("SessionInfoString");
         if (!string.IsNullOrWhiteSpace(sessionInfoString))
         {
@@ -354,6 +364,60 @@ public class Collector
         return "";
     }
 
+    private string? TryReadSessionInfoViaSdkAccessors()
+    {
+        try
+        {
+            var sdkType = _irSdk.GetType();
+
+            foreach (var propertyName in new[]
+            {
+                "SessionInfoString",
+                "SessionInfo",
+                "SessionInfoYaml",
+                "SessionInfoStr",
+                "RawSessionInfo"
+            })
+            {
+                var prop = sdkType.GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
+                if (prop?.CanRead == true)
+                {
+                    var value = prop.GetValue(_irSdk) as string;
+                    if (!string.IsNullOrWhiteSpace(value))
+                    {
+                        return value;
+                    }
+                }
+            }
+
+            foreach (var methodName in new[]
+            {
+                "GetSessionInfoString",
+                "GetSessionInfo",
+                "GetSessionInfoStr",
+                "ReadSessionInfo",
+                "ReadSessionInfoString"
+            })
+            {
+                var method = sdkType.GetMethod(methodName, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase, null, Type.EmptyTypes, null);
+                if (method != null)
+                {
+                    var result = method.Invoke(_irSdk, null) as string;
+                    if (!string.IsNullOrWhiteSpace(result))
+                    {
+                        return result;
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Best-effort probe only.
+        }
+
+        return null;
+    }
+
     private string? TryReadTelemetryString(string variable)
     {
         var value = _irSdk.GetData(variable);
@@ -365,6 +429,44 @@ public class Collector
 
         var text = value.ToString();
         return string.IsNullOrWhiteSpace(text) ? null : text;
+    }
+
+    private static string SanitizeSessionInfoYaml(string yaml)
+    {
+        if (string.IsNullOrWhiteSpace(yaml))
+        {
+            return yaml;
+        }
+
+        var sanitized = yaml.Replace("\0", string.Empty);
+
+        sanitized = Regex.Replace(
+            sanitized,
+            @"(?m)^(\s*(?:TeamName|UserName|AbbrevName|Initials):\s*)(.*)$",
+            match =>
+            {
+                var key = match.Groups[1].Value;
+                var value = match.Groups[2].Value.TrimEnd();
+                if (value.Length == 0)
+                {
+                    return key;
+                }
+
+                if ((value.StartsWith("\"") && value.EndsWith("\"")) || (value.StartsWith("'") && value.EndsWith("'")))
+                {
+                    return key + value;
+                }
+
+                var escaped = value.Replace("\\", "\\\\").Replace("\"", "\\\"");
+                return key + "\"" + escaped + "\"";
+            });
+
+        sanitized = Regex.Replace(
+            sanitized,
+            @"(?m)^(\s*[A-Za-z0-9_]+:\s*)(,.*)$",
+            "$1\"$2\"");
+
+        return sanitized;
     }
 
     private bool TryPopulateDriverCacheFromYamlTree(string sessionInfoYaml)
