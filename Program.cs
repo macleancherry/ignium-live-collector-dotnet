@@ -182,7 +182,7 @@ public class Collector
     
     private int _lastSessionInfoUpdate = -1;
     private SessionInfo? _cachedSessionInfo;
-    private readonly Dictionary<int, DriverInfo> _driverCache = new();
+    private readonly Dictionary<int, DriverData> _driverCache = new();
 
     public Collector(Config config)
     {
@@ -274,7 +274,7 @@ public class Collector
         var now = DateTime.UtcNow.ToString("O");
 
         var sessionId = ReadTelemetryIntScalar("SessionUniqueID")?.ToString() ?? "0";
-        var subsessionId = _cachedSessionInfo?.WeekendInfo?.SubSessionID?.ToString() ?? sessionId;
+        var subsessionId = _cachedSessionInfo?.WeekendInfo?.SubSessionID.ToString() ?? sessionId;
 
         // Read all CarIdx arrays
         var positions = ReadIntArray("CarIdxPosition");
