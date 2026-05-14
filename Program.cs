@@ -236,11 +236,10 @@ public class Collector
 
     private DriverSnapshot? BuildPlayerFallbackRow(string sessionId, string subsessionId, string now)
     {
-        var customerId = ReadTelemetryIntScalar("DriverCarIdx") ?? 0;
-        if (customerId < 0)
-        {
-            customerId = 0;
-        }
+        var rawCarIdx = ReadTelemetryIntScalar("DriverCarIdx") ?? -1;
+        // Worker validation requires customerId > 0. SessionInfo user id is not always available
+        // in this lightweight fallback path, so derive a stable synthetic positive id from car idx.
+        var customerId = rawCarIdx >= 0 ? rawCarIdx + 1 : 1;
 
         var position = ReadTelemetryIntScalar("PlayerCarPosition") ?? 0;
         var classPosition = ReadTelemetryIntScalar("PlayerCarClassPosition") ?? 0;
