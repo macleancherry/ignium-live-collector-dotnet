@@ -1,6 +1,4 @@
-using System.Collections;
 using System.Globalization;
-using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -8,7 +6,7 @@ using DotNetEnv;
 using irsdkSharp;
 
 // Load environment variables
-DotEnv.Load();
+Env.Load();
 
 var config = new Config();
 config.Validate();
@@ -37,8 +35,6 @@ public class Collector
     private readonly Config _config;
     private readonly HttpClient _httpClient;
     private readonly IRacingSDK _irSdk;
-    private object? _sessionInfo;
-    private int _lastSessionInfoUpdate = -1;
 
     public Collector(Config config)
     {
@@ -62,14 +58,7 @@ public class Collector
                     continue;
                 }
 
-                var sessionInfoUpdate = _irSdk.Header.SessionInfoUpdate;
-                if (sessionInfoUpdate != _lastSessionInfoUpdate)
-                {
-                    _lastSessionInfoUpdate = sessionInfoUpdate;
-                    _sessionInfo = _irSdk.GetSerializedSessionInfo();
-                }
-
-                var rows = BuildRows(_sessionInfo);
+                var rows = BuildRows();
                 if (rows.Count == 0)
                 {
                     await Task.Delay(TimeSpan.FromSeconds(_config.PollIntervalSeconds));
@@ -87,65 +76,18 @@ public class Collector
         }
     }
 
-    private List<DriverSnapshot> BuildRows(object? sessionInfo)
+    private List<DriverSnapshot> BuildRows()
     {
         var rows = new List<DriverSnapshot>();
         var now = DateTime.UtcNow.ToString("O");
 
-        var sessionId = ReadPathAsString(sessionInfo, "WeekendInfo", "SessionID") ?? "0";
-        var subsessionId = ReadPathAsString(sessionInfo, "WeekendInfo", "SubSessionID") ?? "0";
-        var drivers = ReadPathAsEnumerable(sessionInfo, "DriverInfo", "Drivers");
+        var sessionId = ReadTelemetryIntScalar("SessionUniqueID")?.ToString() ?? "0";
+        var subsessionId = sessionId;
 
-        if (drivers != null)
+        var playerRow = BuildPlayerFallbackRow(sessionId, subsessionId, now);
+        if (playerRow != null)
         {
-            foreach (var driver in drivers)
-            {
-                var carIdx = ReadPathAsInt(driver, "CarIdx") ?? -1;
-                var customerId =
-                    ReadPathAsInt(driver, "UserID") ??
-                    ReadPathAsInt(driver, "UserId") ??
-                    -1;
-
-                if (carIdx < 0 || customerId <= 0)
-                    continue;
-
-                var position = ReadTelemetryInt("CarIdxPosition", carIdx);
-                var classPosition = ReadTelemetryInt("CarIdxClassPosition", carIdx);
-                var lapCompleted = ReadTelemetryInt("CarIdxLapCompleted", carIdx);
-
-                if (position == null || classPosition == null || lapCompleted == null || position < 0 || classPosition < 0 || lapCompleted < 0)
-                    continue;
-
-                var driverName = ReadPathAsString(driver, "UserName")
-                    ?? ReadPathAsString(driver, "UserNameRaw")
-                    ?? $"User-{customerId}";
-
-                rows.Add(new DriverSnapshot
-                {
-                    SessionId = sessionId,
-                    SubsessionId = subsessionId,
-                    CustomerId = customerId,
-                    DriverName = driverName,
-                    CarNumber = ReadPathAsString(driver, "CarNumber") ?? "",
-                    Position = position.Value,
-                    ClassPosition = classPosition.Value,
-                    Lap = lapCompleted.Value,
-                    LastLap = ReadTelemetryTime("CarIdxLastLapTime", carIdx),
-                    BestLap = ReadTelemetryTime("CarIdxBestLapTime", carIdx),
-                    Interval = ReadTelemetryTime("CarIdxF2Time", carIdx),
-                    Gap = ReadTelemetryTime("CarIdxEstTime", carIdx),
-                    UpdatedAt = now
-                });
-            }
-        }
-
-        if (rows.Count == 0)
-        {
-            var playerRow = BuildPlayerFallbackRow(sessionId, subsessionId, now);
-            if (playerRow != null)
-            {
-                rows.Add(playerRow);
-            }
+            rows.Add(playerRow);
         }
 
         return rows.OrderBy(r => r.Position).ToList();
@@ -153,7 +95,7 @@ public class Collector
 
     private DriverSnapshot? BuildPlayerFallbackRow(string sessionId, string subsessionId, string now)
     {
-        var customerId = ReadTelemetryInt("DriverCarIdx") ?? 0;
+        var customerId = ReadTelemetryIntScalar("DriverCarIdx") ?? 0;
         if (customerId < 0)
         {
             customerId = 0;
@@ -181,24 +123,6 @@ public class Collector
         };
     }
 
-    private int? ReadTelemetryInt(string variable, int idx)
-    {
-        var value = ReadTelemetryIndexed(variable, idx);
-        if (value == null)
-            return null;
-
-        if (int.TryParse(value.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
-            return parsed;
-
-        return null;
-    }
-
-    private double? ReadTelemetryTime(string variable, int idx)
-    {
-        var value = ReadTelemetryIndexed(variable, idx);
-        return NormalizeTime(ToDouble(value));
-    }
-
     private int? ReadTelemetryIntScalar(string variable)
     {
         var value = _irSdk.GetData(variable);
@@ -213,72 +137,6 @@ public class Collector
     {
         var value = _irSdk.GetData(variable);
         return NormalizeTime(ToDouble(value));
-    }
-
-    private object? ReadTelemetryIndexed(string variable, int idx)
-    {
-        var value = _irSdk.GetData(variable);
-        if (value is Array arr)
-        {
-            if (idx >= 0 && idx < arr.Length)
-                return arr.GetValue(idx);
-            return null;
-        }
-
-        if (value is IList list)
-        {
-            if (idx >= 0 && idx < list.Count)
-                return list[idx];
-            return null;
-        }
-
-        return null;
-    }
-
-    private static IEnumerable<object>? ReadPathAsEnumerable(object? root, params string[] path)
-    {
-        var value = ReadPathValue(root, path);
-        if (value is string || value is null)
-            return null;
-        if (value is IEnumerable enumerable)
-            return enumerable.Cast<object>();
-        return null;
-    }
-
-    private static string? ReadPathAsString(object? root, params string[] path)
-    {
-        var value = ReadPathValue(root, path);
-        return value?.ToString();
-    }
-
-    private static int? ReadPathAsInt(object? root, params string[] path)
-    {
-        var value = ReadPathValue(root, path);
-        if (value == null)
-            return null;
-        if (value is int i)
-            return i;
-        if (int.TryParse(value.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
-            return parsed;
-        return null;
-    }
-
-    private static object? ReadPathValue(object? root, params string[] path)
-    {
-        object? current = root;
-        foreach (var segment in path)
-        {
-            if (current == null)
-                return null;
-
-            var prop = current.GetType().GetProperty(segment, BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase);
-            if (prop == null)
-                return null;
-
-            current = prop.GetValue(current);
-        }
-
-        return current;
     }
 
     private static double? ToDouble(object? value)
