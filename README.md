@@ -14,6 +14,18 @@ Standalone Windows executable for collecting live timing from iRSDK and pushing 
    ```
 3. Double-click `IgniumLiveCollector.exe` (make sure iRacing is running)
 
+## Automated Builds and Releases
+
+- Every push to `main` automatically builds the Windows EXE and uploads it as a workflow artifact.
+- Every pushed tag like `v1.0.0` automatically creates/updates a GitHub Release and attaches `IgniumLiveCollector.exe`.
+
+To publish a new release build:
+
+```powershell
+git tag v1.0.0
+git push origin v1.0.0
+```
+
 ## Requirements
 
 - Windows 10 or later
