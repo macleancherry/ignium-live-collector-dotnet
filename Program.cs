@@ -276,17 +276,19 @@ public class Collector
 
     private void UpdateSessionInfo()
     {
-        var updateCounter = ReadTelemetryIntScalar("SessionInfoUpdate") ?? 0;
-        if (updateCounter == _lastSessionInfoUpdate)
+        var updateCounterRaw = ReadTelemetryIntScalar("SessionInfoUpdate");
+        var updateCounter = updateCounterRaw ?? -1;
+        var hasCachedYaml = !string.IsNullOrWhiteSpace(_lastSessionInfoYaml);
+        if (updateCounter == _lastSessionInfoUpdate && hasCachedYaml)
             return;
 
         _lastSessionInfoUpdate = updateCounter;
         try
         {
-            var sessionInfoYaml = _irSdk.GetData("SessionInfoString") as string;
+            var sessionInfoYaml = TryReadSessionInfoYaml();
             if (string.IsNullOrWhiteSpace(sessionInfoYaml))
             {
-                Console.WriteLine("[collector] warning: empty SessionInfoString");
+                Console.WriteLine("[collector] warning: empty session info payload (keys tried: SessionInfoString, SessionInfo)");
                 return;
             }
 
@@ -333,6 +335,36 @@ public class Collector
         {
             Console.WriteLine("[collector] warning: failed to parse SessionInfoString: {0}", ex.Message);
         }
+    }
+
+    private string TryReadSessionInfoYaml()
+    {
+        var sessionInfoString = TryReadTelemetryString("SessionInfoString");
+        if (!string.IsNullOrWhiteSpace(sessionInfoString))
+        {
+            return sessionInfoString;
+        }
+
+        var sessionInfo = TryReadTelemetryString("SessionInfo");
+        if (!string.IsNullOrWhiteSpace(sessionInfo))
+        {
+            return sessionInfo;
+        }
+
+        return "";
+    }
+
+    private string? TryReadTelemetryString(string variable)
+    {
+        var value = _irSdk.GetData(variable);
+        if (value == null)
+            return null;
+
+        if (value is string str)
+            return str;
+
+        var text = value.ToString();
+        return string.IsNullOrWhiteSpace(text) ? null : text;
     }
 
     private bool TryPopulateDriverCacheFromYamlTree(string sessionInfoYaml)
@@ -622,6 +654,19 @@ public class Collector
                 SessionInfoUpdate = ReadTelemetryIntScalar("SessionInfoUpdate"),
                 SessionUniqueId = ReadTelemetryIntScalar("SessionUniqueID"),
                 SessionInfoYaml = _lastSessionInfoYaml,
+                SessionInfoYamlChars = _lastSessionInfoYaml.Length,
+                DebugNotes = string.IsNullOrWhiteSpace(_lastSessionInfoYaml)
+                    ? "Session info YAML is empty in cache"
+                    : "Session info YAML captured",
+                VariableProbes = new List<DebugVarProbe>
+                {
+                    BuildVarProbe("SessionInfoUpdate"),
+                    BuildVarProbe("SessionInfoString"),
+                    BuildVarProbe("SessionInfo"),
+                    BuildVarProbe("SessionUniqueID"),
+                    BuildVarProbe("DriverInfo"),
+                    BuildVarProbe("WeekendInfo")
+                },
                 CarIdxPosition = ReadIntArray("CarIdxPosition"),
                 CarIdxClassPosition = ReadIntArray("CarIdxClassPosition"),
                 CarIdxLapCompleted = ReadIntArray("CarIdxLapCompleted"),
@@ -629,6 +674,7 @@ public class Collector
                 CarIdxBestLapTime = ReadDoubleArray("CarIdxBestLapTime"),
                 CarIdxF2Time = ReadDoubleArray("CarIdxF2Time"),
                 CarIdxEstTime = ReadDoubleArray("CarIdxEstTime"),
+                CachedDriverCount = _driverCache.Count,
                 ParsedDriverCache = _driverCache.Values
                     .Select(x => new DebugDriver
                     {
@@ -663,6 +709,72 @@ public class Collector
         {
             Console.WriteLine("[collector] debug raw error: {0}", ex.Message);
         }
+    }
+
+    private DebugVarProbe BuildVarProbe(string variable)
+    {
+        var value = _irSdk.GetData(variable);
+        if (value == null)
+        {
+            return new DebugVarProbe
+            {
+                Name = variable,
+                Exists = false,
+                Type = null,
+                Preview = null,
+                Length = null
+            };
+        }
+
+        return new DebugVarProbe
+        {
+            Name = variable,
+            Exists = true,
+            Type = value.GetType().FullName,
+            Preview = BuildValuePreview(value),
+            Length = GetValueLength(value)
+        };
+    }
+
+    private static string BuildValuePreview(object value)
+    {
+        if (value is string str)
+        {
+            return Truncate(str.Replace("\r", "").Replace("\n", "\\n"), 240);
+        }
+
+        if (value is int[] intArr)
+        {
+            return $"int[{intArr.Length}] first=[{string.Join(",", intArr.Take(8))}]";
+        }
+
+        if (value is float[] floatArr)
+        {
+            return $"float[{floatArr.Length}] first=[{string.Join(",", floatArr.Take(4).Select(x => x.ToString("F3", CultureInfo.InvariantCulture)))}]";
+        }
+
+        if (value is double[] doubleArr)
+        {
+            return $"double[{doubleArr.Length}] first=[{string.Join(",", doubleArr.Take(4).Select(x => x.ToString("F3", CultureInfo.InvariantCulture)))}]";
+        }
+
+        return Truncate(value.ToString() ?? "", 240);
+    }
+
+    private static int? GetValueLength(object value)
+    {
+        if (value is string str)
+            return str.Length;
+        if (value is Array arr)
+            return arr.Length;
+        return null;
+    }
+
+    private static string Truncate(string value, int maxChars)
+    {
+        if (value.Length <= maxChars)
+            return value;
+        return value.Substring(0, maxChars);
     }
 }
 
@@ -701,6 +813,15 @@ public class DebugRawSnapshot
     [JsonPropertyName("sessionInfoYaml")]
     public string SessionInfoYaml { get; set; } = "";
 
+    [JsonPropertyName("sessionInfoYamlChars")]
+    public int SessionInfoYamlChars { get; set; }
+
+    [JsonPropertyName("debugNotes")]
+    public string DebugNotes { get; set; } = "";
+
+    [JsonPropertyName("variableProbes")]
+    public List<DebugVarProbe> VariableProbes { get; set; } = new();
+
     [JsonPropertyName("carIdxPosition")]
     public int[]? CarIdxPosition { get; set; }
 
@@ -722,8 +843,29 @@ public class DebugRawSnapshot
     [JsonPropertyName("carIdxEstTime")]
     public double[]? CarIdxEstTime { get; set; }
 
+    [JsonPropertyName("cachedDriverCount")]
+    public int CachedDriverCount { get; set; }
+
     [JsonPropertyName("parsedDriverCache")]
     public List<DebugDriver> ParsedDriverCache { get; set; } = new();
+}
+
+public class DebugVarProbe
+{
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+
+    [JsonPropertyName("exists")]
+    public bool Exists { get; set; }
+
+    [JsonPropertyName("type")]
+    public string? Type { get; set; }
+
+    [JsonPropertyName("length")]
+    public int? Length { get; set; }
+
+    [JsonPropertyName("preview")]
+    public string? Preview { get; set; }
 }
 
 public class DebugDriver
