@@ -499,7 +499,7 @@ public class SessionInfo
 {
     public WeekendInfo? WeekendInfo { get; set; }
     public DriverInfo? DriverInfo { get; set; }
-    public List<SessionData>? SessionInfo { get; set; }
+    public List<SessionData>? Sessions { get; set; }
 }
 
 public class WeekendInfo
