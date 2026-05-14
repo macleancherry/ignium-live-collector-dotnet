@@ -1,14 +1,11 @@
 using System.Globalization;
+using System.IO;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using DotNetEnv;
 using irsdkSharp;
 
-// Load environment variables
-Env.Load();
-
-var config = new Config();
+var config = ConfigBootstrap.LoadOrPrompt();
 config.Validate();
 
 var collector = new Collector(config);
@@ -16,10 +13,10 @@ await collector.RunAsync();
 
 public class Config
 {
-    public string IngestUrl { get; set; } = Environment.GetEnvironmentVariable("LIVE_API_INGEST_URL") ?? "";
-    public string IngestToken { get; set; } = Environment.GetEnvironmentVariable("LIVE_API_INGEST_TOKEN") ?? "";
-    public int PollIntervalSeconds { get; set; } = int.Parse(Environment.GetEnvironmentVariable("POLL_INTERVAL_SECONDS") ?? "10");
-    public int TimeoutSeconds { get; set; } = int.Parse(Environment.GetEnvironmentVariable("REQUEST_TIMEOUT_SECONDS") ?? "10");
+    public string IngestUrl { get; set; } = "";
+    public string IngestToken { get; set; } = "";
+    public int PollIntervalSeconds { get; set; } = 10;
+    public int TimeoutSeconds { get; set; } = 10;
 
     public void Validate()
     {
@@ -27,6 +24,150 @@ public class Config
             throw new InvalidOperationException("LIVE_API_INGEST_URL and LIVE_API_INGEST_TOKEN are required");
         if (PollIntervalSeconds < 5)
             throw new InvalidOperationException("POLL_INTERVAL_SECONDS must be >= 5");
+    }
+}
+
+public static class ConfigBootstrap
+{
+    public static Config LoadOrPrompt()
+    {
+        var exeDir = AppContext.BaseDirectory;
+        var envPath = Path.Combine(exeDir, ".env");
+        var map = LoadEnvMap(envPath);
+
+        map.TryGetValue("LIVE_API_INGEST_URL", out var ingestUrl);
+        map.TryGetValue("LIVE_API_INGEST_TOKEN", out var ingestToken);
+        var poll = ParseInt(map, "POLL_INTERVAL_SECONDS", 10);
+        var timeout = ParseInt(map, "REQUEST_TIMEOUT_SECONDS", 10);
+
+        if (!string.IsNullOrWhiteSpace(ingestUrl) && !string.IsNullOrWhiteSpace(ingestToken))
+        {
+            return new Config
+            {
+                IngestUrl = ingestUrl,
+                IngestToken = ingestToken,
+                PollIntervalSeconds = poll,
+                TimeoutSeconds = timeout
+            };
+        }
+
+        Console.WriteLine("[setup] First run setup required.");
+        Console.WriteLine("[setup] Enter values once; they will be saved next to the executable.");
+
+        var url = PromptRequired("LIVE_API_INGEST_URL", ingestUrl);
+        var token = PromptRequired("LIVE_API_INGEST_TOKEN", ingestToken);
+        var pollInput = PromptOptional("POLL_INTERVAL_SECONDS", poll.ToString(CultureInfo.InvariantCulture));
+        var timeoutInput = PromptOptional("REQUEST_TIMEOUT_SECONDS", timeout.ToString(CultureInfo.InvariantCulture));
+
+        if (!int.TryParse(pollInput, NumberStyles.Integer, CultureInfo.InvariantCulture, out poll) || poll < 5)
+        {
+            poll = 10;
+        }
+
+        if (!int.TryParse(timeoutInput, NumberStyles.Integer, CultureInfo.InvariantCulture, out timeout) || timeout < 1)
+        {
+            timeout = 10;
+        }
+
+        var lines = new[]
+        {
+            $"LIVE_API_INGEST_URL={url}",
+            $"LIVE_API_INGEST_TOKEN={token}",
+            $"POLL_INTERVAL_SECONDS={poll}",
+            $"REQUEST_TIMEOUT_SECONDS={timeout}"
+        };
+
+        File.WriteAllLines(envPath, lines, Encoding.ASCII);
+        Console.WriteLine("[setup] Saved configuration to .env");
+
+        return new Config
+        {
+            IngestUrl = url,
+            IngestToken = token,
+            PollIntervalSeconds = poll,
+            TimeoutSeconds = timeout
+        };
+    }
+
+    private static Dictionary<string, string> LoadEnvMap(string path)
+    {
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (!File.Exists(path))
+        {
+            return map;
+        }
+
+        foreach (var raw in File.ReadAllLines(path))
+        {
+            var line = raw.Trim();
+            if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var idx = line.IndexOf('=');
+            if (idx <= 0)
+            {
+                continue;
+            }
+
+            var key = line.Substring(0, idx).Trim();
+            var value = line[(idx + 1)..].Trim();
+            map[key] = value;
+        }
+
+        return map;
+    }
+
+    private static int ParseInt(Dictionary<string, string> map, string key, int fallback)
+    {
+        if (!map.TryGetValue(key, out var value))
+        {
+            return fallback;
+        }
+
+        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
+        {
+            return parsed;
+        }
+
+        return fallback;
+    }
+
+    private static string PromptRequired(string key, string? current)
+    {
+        while (true)
+        {
+            if (string.IsNullOrWhiteSpace(current))
+            {
+                Console.Write($"{key}: ");
+            }
+            else
+            {
+                Console.Write($"{key} [{current}]: ");
+            }
+
+            var value = Console.ReadLine();
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                if (!string.IsNullOrWhiteSpace(current))
+                {
+                    return current;
+                }
+
+                Console.WriteLine($"[setup] {key} is required.");
+                continue;
+            }
+
+            return value.Trim();
+        }
+    }
+
+    private static string PromptOptional(string key, string current)
+    {
+        Console.Write($"{key} [{current}]: ");
+        var value = Console.ReadLine();
+        return string.IsNullOrWhiteSpace(value) ? current : value.Trim();
     }
 }
 
