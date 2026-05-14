@@ -1,7 +1,11 @@
+using System.Collections;
+using System.Globalization;
+using System.Reflection;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using DotNetEnv;
-using iRSDKSharp;
+using irsdkSharp;
 
 // Load environment variables
 DotEnv.Load();
@@ -32,13 +36,15 @@ public class Collector
 {
     private readonly Config _config;
     private readonly HttpClient _httpClient;
-    private readonly iRSDK _irSdk;
+    private readonly IRacingSDK _irSdk;
+    private object? _sessionInfo;
+    private int _lastSessionInfoUpdate = -1;
 
     public Collector(Config config)
     {
         _config = config;
         _httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(config.TimeoutSeconds) };
-        _irSdk = new iRSDK();
+        _irSdk = new IRacingSDK();
     }
 
     public async Task RunAsync()
@@ -49,23 +55,26 @@ public class Collector
         {
             try
             {
-                if (!_irSdk.IsConnected)
+                if (!_irSdk.IsConnected())
                 {
                     Console.WriteLine("[collector] waiting for iRacing session");
                     await Task.Delay(TimeSpan.FromSeconds(_config.PollIntervalSeconds));
                     continue;
                 }
 
-                var sessionInfo = _irSdk.GetSessionInfo();
-                var telemetry = _irSdk.GetTelemetry();
+                var sessionInfoUpdate = _irSdk.Header.SessionInfoUpdate;
+                if (sessionInfoUpdate != _lastSessionInfoUpdate)
+                {
+                    _lastSessionInfoUpdate = sessionInfoUpdate;
+                    _sessionInfo = _irSdk.GetSerializedSessionInfo();
+                }
 
-                if (sessionInfo == null || telemetry == null)
+                var rows = BuildRows(_sessionInfo);
+                if (rows.Count == 0)
                 {
                     await Task.Delay(TimeSpan.FromSeconds(_config.PollIntervalSeconds));
                     continue;
                 }
-
-                var rows = BuildRows(sessionInfo, telemetry);
                 await PostRows(rows);
 
                 await Task.Delay(TimeSpan.FromSeconds(_config.PollIntervalSeconds));
@@ -78,49 +87,211 @@ public class Collector
         }
     }
 
-    private List<DriverSnapshot> BuildRows(SessionInfo sessionInfo, Telemetry telemetry)
+    private List<DriverSnapshot> BuildRows(object? sessionInfo)
     {
         var rows = new List<DriverSnapshot>();
         var now = DateTime.UtcNow.ToString("O");
 
-        var sessionId = sessionInfo.WeekendInfo?.SessionID?.ToString() ?? "0";
-        var subsessionId = sessionInfo.WeekendInfo?.SubSessionID?.ToString() ?? "0";
-        var drivers = sessionInfo.DriverInfo?.Drivers ?? new();
+        var sessionId = ReadPathAsString(sessionInfo, "WeekendInfo", "SessionID") ?? "0";
+        var subsessionId = ReadPathAsString(sessionInfo, "WeekendInfo", "SubSessionID") ?? "0";
+        var drivers = ReadPathAsEnumerable(sessionInfo, "DriverInfo", "Drivers");
 
-        foreach (var driver in drivers)
+        if (drivers != null)
         {
-            var carIdx = driver.CarIdx;
-            var customerId = driver.UserID;
-
-            if (carIdx < 0 || customerId <= 0)
-                continue;
-
-            var position = telemetry.CarIdxPosition?[carIdx];
-            var classPosition = telemetry.CarIdxClassPosition?[carIdx];
-            var lapCompleted = telemetry.CarIdxLapCompleted?[carIdx];
-
-            if (position == null || classPosition == null || lapCompleted == null || position < 0 || classPosition < 0 || lapCompleted < 0)
-                continue;
-
-            rows.Add(new DriverSnapshot
+            foreach (var driver in drivers)
             {
-                SessionId = sessionId,
-                SubsessionId = subsessionId,
-                CustomerId = customerId,
-                DriverName = driver.UserName ?? $"User-{customerId}",
-                CarNumber = driver.CarNumber ?? "",
-                Position = (int)position,
-                ClassPosition = (int)classPosition,
-                Lap = (int)lapCompleted,
-                LastLap = NormalizeTime(telemetry.CarIdxLastLapTime?[carIdx]),
-                BestLap = NormalizeTime(telemetry.CarIdxBestLapTime?[carIdx]),
-                Interval = NormalizeTime(telemetry.CarIdxF2Time?[carIdx]),
-                Gap = NormalizeTime(telemetry.CarIdxEstTime?[carIdx]),
-                UpdatedAt = now
-            });
+                var carIdx = ReadPathAsInt(driver, "CarIdx") ?? -1;
+                var customerId =
+                    ReadPathAsInt(driver, "UserID") ??
+                    ReadPathAsInt(driver, "UserId") ??
+                    -1;
+
+                if (carIdx < 0 || customerId <= 0)
+                    continue;
+
+                var position = ReadTelemetryInt("CarIdxPosition", carIdx);
+                var classPosition = ReadTelemetryInt("CarIdxClassPosition", carIdx);
+                var lapCompleted = ReadTelemetryInt("CarIdxLapCompleted", carIdx);
+
+                if (position == null || classPosition == null || lapCompleted == null || position < 0 || classPosition < 0 || lapCompleted < 0)
+                    continue;
+
+                var driverName = ReadPathAsString(driver, "UserName")
+                    ?? ReadPathAsString(driver, "UserNameRaw")
+                    ?? $"User-{customerId}";
+
+                rows.Add(new DriverSnapshot
+                {
+                    SessionId = sessionId,
+                    SubsessionId = subsessionId,
+                    CustomerId = customerId,
+                    DriverName = driverName,
+                    CarNumber = ReadPathAsString(driver, "CarNumber") ?? "",
+                    Position = position.Value,
+                    ClassPosition = classPosition.Value,
+                    Lap = lapCompleted.Value,
+                    LastLap = ReadTelemetryTime("CarIdxLastLapTime", carIdx),
+                    BestLap = ReadTelemetryTime("CarIdxBestLapTime", carIdx),
+                    Interval = ReadTelemetryTime("CarIdxF2Time", carIdx),
+                    Gap = ReadTelemetryTime("CarIdxEstTime", carIdx),
+                    UpdatedAt = now
+                });
+            }
+        }
+
+        if (rows.Count == 0)
+        {
+            var playerRow = BuildPlayerFallbackRow(sessionId, subsessionId, now);
+            if (playerRow != null)
+            {
+                rows.Add(playerRow);
+            }
         }
 
         return rows.OrderBy(r => r.Position).ToList();
+    }
+
+    private DriverSnapshot? BuildPlayerFallbackRow(string sessionId, string subsessionId, string now)
+    {
+        var customerId = ReadTelemetryInt("DriverCarIdx") ?? 0;
+        if (customerId < 0)
+        {
+            customerId = 0;
+        }
+
+        var position = ReadTelemetryIntScalar("PlayerCarPosition") ?? 0;
+        var classPosition = ReadTelemetryIntScalar("PlayerCarClassPosition") ?? 0;
+        var lap = ReadTelemetryIntScalar("LapCompleted") ?? 0;
+
+        return new DriverSnapshot
+        {
+            SessionId = sessionId,
+            SubsessionId = subsessionId,
+            CustomerId = customerId,
+            DriverName = "Player",
+            CarNumber = string.Empty,
+            Position = Math.Max(0, position),
+            ClassPosition = Math.Max(0, classPosition),
+            Lap = Math.Max(0, lap),
+            LastLap = ReadTelemetryTimeScalar("LapLastLapTime"),
+            BestLap = ReadTelemetryTimeScalar("LapBestLapTime"),
+            Interval = null,
+            Gap = null,
+            UpdatedAt = now
+        };
+    }
+
+    private int? ReadTelemetryInt(string variable, int idx)
+    {
+        var value = ReadTelemetryIndexed(variable, idx);
+        if (value == null)
+            return null;
+
+        if (int.TryParse(value.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
+            return parsed;
+
+        return null;
+    }
+
+    private double? ReadTelemetryTime(string variable, int idx)
+    {
+        var value = ReadTelemetryIndexed(variable, idx);
+        return NormalizeTime(ToDouble(value));
+    }
+
+    private int? ReadTelemetryIntScalar(string variable)
+    {
+        var value = _irSdk.GetData(variable);
+        if (value == null)
+            return null;
+        if (int.TryParse(value.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
+            return parsed;
+        return null;
+    }
+
+    private double? ReadTelemetryTimeScalar(string variable)
+    {
+        var value = _irSdk.GetData(variable);
+        return NormalizeTime(ToDouble(value));
+    }
+
+    private object? ReadTelemetryIndexed(string variable, int idx)
+    {
+        var value = _irSdk.GetData(variable);
+        if (value is Array arr)
+        {
+            if (idx >= 0 && idx < arr.Length)
+                return arr.GetValue(idx);
+            return null;
+        }
+
+        if (value is IList list)
+        {
+            if (idx >= 0 && idx < list.Count)
+                return list[idx];
+            return null;
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<object>? ReadPathAsEnumerable(object? root, params string[] path)
+    {
+        var value = ReadPathValue(root, path);
+        if (value is string || value is null)
+            return null;
+        if (value is IEnumerable enumerable)
+            return enumerable.Cast<object>();
+        return null;
+    }
+
+    private static string? ReadPathAsString(object? root, params string[] path)
+    {
+        var value = ReadPathValue(root, path);
+        return value?.ToString();
+    }
+
+    private static int? ReadPathAsInt(object? root, params string[] path)
+    {
+        var value = ReadPathValue(root, path);
+        if (value == null)
+            return null;
+        if (value is int i)
+            return i;
+        if (int.TryParse(value.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
+            return parsed;
+        return null;
+    }
+
+    private static object? ReadPathValue(object? root, params string[] path)
+    {
+        object? current = root;
+        foreach (var segment in path)
+        {
+            if (current == null)
+                return null;
+
+            var prop = current.GetType().GetProperty(segment, BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase);
+            if (prop == null)
+                return null;
+
+            current = prop.GetValue(current);
+        }
+
+        return current;
+    }
+
+    private static double? ToDouble(object? value)
+    {
+        if (value == null)
+            return null;
+        if (value is double d)
+            return d;
+        if (value is float f)
+            return f;
+        if (double.TryParse(value.ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed))
+            return parsed;
+        return null;
     }
 
     private double? NormalizeTime(double? value)
@@ -150,7 +321,7 @@ public class Collector
         try
         {
             var json = JsonSerializer.Serialize(payload);
-            var content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
 
             var request = new HttpRequestMessage(HttpMethod.Post, _config.IngestUrl)
             {
@@ -180,7 +351,6 @@ public class Collector
     }
 }
 
-[JsonSerializable]
 public class IngestPayload
 {
     [JsonPropertyName("source")]
@@ -193,7 +363,6 @@ public class IngestPayload
     public List<DriverSnapshot> Rows { get; set; } = new();
 }
 
-[JsonSerializable]
 public class DriverSnapshot
 {
     [JsonPropertyName("sessionId")]
