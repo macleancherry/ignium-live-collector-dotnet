@@ -249,6 +249,16 @@ public class Collector
             }
 
             _cachedSessionInfo = _yamlDeserializer.Deserialize<SessionInfo>(sessionInfoYaml);
+            if (_cachedSessionInfo?.DriverInfo?.Drivers == null || _cachedSessionInfo.DriverInfo.Drivers.Count == 0)
+            {
+                // Some SDK payloads are wrapped in a top-level SessionInfo node.
+                var wrapped = _yamlDeserializer.Deserialize<SessionInfoEnvelope>(sessionInfoYaml);
+                if (wrapped?.SessionInfo != null)
+                {
+                    _cachedSessionInfo = wrapped.SessionInfo;
+                }
+            }
+
             _driverCache.Clear();
 
             if (_cachedSessionInfo?.DriverInfo?.Drivers != null)
@@ -259,6 +269,11 @@ public class Collector
                     if (driver.CarIdx >= 0)
                     {
                         _driverCache[driver.CarIdx] = driver;
+                    }
+
+                    if (!_driverCache.ContainsKey(i))
+                    {
+                        _driverCache[i] = driver;
                     }
                 }
             }
@@ -503,6 +518,11 @@ public class SessionInfo
     public WeekendInfo? WeekendInfo { get; set; }
     public DriverInfo? DriverInfo { get; set; }
     public List<SessionData>? Sessions { get; set; }
+}
+
+public class SessionInfoEnvelope
+{
+    public SessionInfo? SessionInfo { get; set; }
 }
 
 public class WeekendInfo
