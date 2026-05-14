@@ -9,6 +9,8 @@ Standalone Windows executable for collecting live timing from iRSDK and pushing 
    ```
    LIVE_API_INGEST_URL=https://your-worker-url/api/live/ingest
    LIVE_API_INGEST_TOKEN=your_secret_token
+   DEBUG_RAW_ENABLED=false
+   LIVE_API_DEBUG_RAW_URL=https://your-worker-url/api/live/debug/raw
    POLL_INTERVAL_SECONDS=10
    REQUEST_TIMEOUT_SECONDS=10
    ```
@@ -64,6 +66,8 @@ Create `.env` in the same directory as the exe:
 ```
 LIVE_API_INGEST_URL=https://your-worker-url/api/live/ingest
 LIVE_API_INGEST_TOKEN=your_secret_token
+DEBUG_RAW_ENABLED=false
+LIVE_API_DEBUG_RAW_URL=https://your-worker-url/api/live/debug/raw
 POLL_INTERVAL_SECONDS=10
 REQUEST_TIMEOUT_SECONDS=10
 ```
