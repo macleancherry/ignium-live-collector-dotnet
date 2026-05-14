@@ -4,6 +4,8 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using irsdkSharp;
+using YamlDotNet.Serialization;
+using YamlDotNet.Serialization.NamingConventions;
 
 var config = ConfigBootstrap.LoadOrPrompt();
 config.Validate();
@@ -176,12 +178,21 @@ public class Collector
     private readonly Config _config;
     private readonly HttpClient _httpClient;
     private readonly IRacingSDK _irSdk;
+    private readonly IDeserializer _yamlDeserializer;
+    
+    private int _lastSessionInfoUpdate = -1;
+    private SessionInfo? _cachedSessionInfo;
+    private readonly Dictionary<int, DriverInfo> _driverCache = new();
 
     public Collector(Config config)
     {
         _config = config;
         _httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(config.TimeoutSeconds) };
         _irSdk = new IRacingSDK();
+        _yamlDeserializer = new DeserializerBuilder()
+            .WithNamingConvention(CamelCaseNamingConvention.Instance)
+            .IgnoreUnmatchedProperties()
+            .Build();
     }
 
     public async Task RunAsync()
@@ -195,10 +206,14 @@ public class Collector
                 if (!_irSdk.IsConnected())
                 {
                     Console.WriteLine("[collector] waiting for iRacing session");
+                    _lastSessionInfoUpdate = -1;
+                    _cachedSessionInfo = null;
+                    _driverCache.Clear();
                     await Task.Delay(TimeSpan.FromSeconds(_config.PollIntervalSeconds));
                     continue;
                 }
 
+                UpdateSessionInfo();
                 var rows = BuildRows();
                 if (rows.Count == 0)
                 {
@@ -217,50 +232,145 @@ public class Collector
         }
     }
 
+    private void UpdateSessionInfo()
+    {
+        var updateCounter = ReadTelemetryIntScalar("SessionInfoUpdate") ?? 0;
+        if (updateCounter == _lastSessionInfoUpdate)
+            return;
+
+        _lastSessionInfoUpdate = updateCounter;
+        try
+        {
+            var sessionInfoYaml = _irSdk.GetData("SessionInfoString") as string;
+            if (string.IsNullOrWhiteSpace(sessionInfoYaml))
+            {
+                Console.WriteLine("[collector] warning: empty SessionInfoString");
+                return;
+            }
+
+            _cachedSessionInfo = _yamlDeserializer.Deserialize<SessionInfo>(sessionInfoYaml);
+            _driverCache.Clear();
+
+            if (_cachedSessionInfo?.DriverInfo?.Drivers != null)
+            {
+                for (int i = 0; i < _cachedSessionInfo.DriverInfo.Drivers.Count; i++)
+                {
+                    var driver = _cachedSessionInfo.DriverInfo.Drivers[i];
+                    _driverCache[i] = driver;
+                }
+            }
+
+            Console.WriteLine("[collector] updated session info with {0} drivers", _driverCache.Count);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[collector] warning: failed to parse SessionInfoString: {0}", ex.Message);
+        }
+    }
+
     private List<DriverSnapshot> BuildRows()
     {
         var rows = new List<DriverSnapshot>();
         var now = DateTime.UtcNow.ToString("O");
 
         var sessionId = ReadTelemetryIntScalar("SessionUniqueID")?.ToString() ?? "0";
-        var subsessionId = sessionId;
+        var subsessionId = _cachedSessionInfo?.WeekendInfo?.SubSessionID?.ToString() ?? sessionId;
 
-        var playerRow = BuildPlayerFallbackRow(sessionId, subsessionId, now);
-        if (playerRow != null)
+        // Read all CarIdx arrays
+        var positions = ReadIntArray("CarIdxPosition");
+        var classPositions = ReadIntArray("CarIdxClassPosition");
+        var lapsCompleted = ReadIntArray("CarIdxLapCompleted");
+        var lastLapTimes = ReadDoubleArray("CarIdxLastLapTime");
+        var bestLapTimes = ReadDoubleArray("CarIdxBestLapTime");
+        var f2Times = ReadDoubleArray("CarIdxF2Time");
+        var estTimes = ReadDoubleArray("CarIdxEstTime");
+
+        if (positions == null || positions.Length == 0)
         {
-            rows.Add(playerRow);
+            return rows; // No cars on track
         }
 
-        return rows.OrderBy(r => r.Position).ToList();
+        // Build driver snapshots
+        for (int carIdx = 0; carIdx < positions.Length; carIdx++)
+        {
+            var position = positions[carIdx];
+            if (position < 0) continue; // Car not active in session
+
+            var driverName = "Unknown";
+            var carNumber = "";
+            var customerId = carIdx + 1; // Fallback synthetic ID
+
+            if (_driverCache.TryGetValue(carIdx, out var driverInfo))
+            {
+                if (!string.IsNullOrWhiteSpace(driverInfo.UserName))
+                    driverName = driverInfo.UserName;
+                if (!string.IsNullOrWhiteSpace(driverInfo.CarNumber))
+                    carNumber = driverInfo.CarNumber;
+                if (driverInfo.UserID > 0)
+                    customerId = driverInfo.UserID;
+            }
+
+            var classPosition = classPositions?[carIdx] ?? 0;
+            var lap = lapsCompleted?[carIdx] ?? 0;
+            var lastLap = lastLapTimes?[carIdx];
+            var bestLap = bestLapTimes?[carIdx];
+            var gap = f2Times?[carIdx]; // Time delta to leader
+            double? interval = null;
+
+            rows.Add(new DriverSnapshot
+            {
+                SessionId = sessionId,
+                SubsessionId = subsessionId,
+                CustomerId = customerId,
+                DriverName = driverName,
+                CarNumber = carNumber,
+                Position = Math.Max(0, position),
+                ClassPosition = Math.Max(0, classPosition),
+                Lap = Math.Max(0, lap),
+                LastLap = NormalizeTime(lastLap),
+                BestLap = NormalizeTime(bestLap),
+                Gap = NormalizeTime(gap),
+                Interval = interval,
+                UpdatedAt = now
+            });
+        }
+
+        // Compute intervals (gap to car ahead in same class)
+        for (int i = 1; i < rows.Count; i++)
+        {
+            var current = rows[i];
+            var ahead = rows.FirstOrDefault(r => r.ClassPosition == current.ClassPosition - 1);
+            if (ahead != null && ahead.LastLap.HasValue && current.LastLap.HasValue)
+            {
+                // Simple interval: difference in last lap times
+                var delta = current.LastLap.Value - ahead.LastLap.Value;
+                current.Interval = NormalizeTime(delta);
+            }
+        }
+
+        return rows;
     }
 
-    private DriverSnapshot? BuildPlayerFallbackRow(string sessionId, string subsessionId, string now)
+    private int[]? ReadIntArray(string variable)
     {
-        var rawCarIdx = ReadTelemetryIntScalar("DriverCarIdx") ?? -1;
-        // Worker validation requires customerId > 0. SessionInfo user id is not always available
-        // in this lightweight fallback path, so derive a stable synthetic positive id from car idx.
-        var customerId = rawCarIdx >= 0 ? rawCarIdx + 1 : 1;
+        var value = _irSdk.GetData(variable);
+        if (value == null)
+            return null;
+        if (value is int[] intArr)
+            return intArr;
+        return null;
+    }
 
-        var position = ReadTelemetryIntScalar("PlayerCarPosition") ?? 0;
-        var classPosition = ReadTelemetryIntScalar("PlayerCarClassPosition") ?? 0;
-        var lap = ReadTelemetryIntScalar("LapCompleted") ?? 0;
-
-        return new DriverSnapshot
-        {
-            SessionId = sessionId,
-            SubsessionId = subsessionId,
-            CustomerId = customerId,
-            DriverName = "Player",
-            CarNumber = string.Empty,
-            Position = Math.Max(0, position),
-            ClassPosition = Math.Max(0, classPosition),
-            Lap = Math.Max(0, lap),
-            LastLap = ReadTelemetryTimeScalar("LapLastLapTime"),
-            BestLap = ReadTelemetryTimeScalar("LapBestLapTime"),
-            Interval = null,
-            Gap = null,
-            UpdatedAt = now
-        };
+    private double[]? ReadDoubleArray(string variable)
+    {
+        var value = _irSdk.GetData(variable);
+        if (value == null)
+            return null;
+        if (value is double[] dblArr)
+            return dblArr;
+        if (value is float[] fltArr)
+            return Array.ConvertAll(fltArr, x => (double)x);
+        return null;
     }
 
     private int? ReadTelemetryIntScalar(string variable)
@@ -269,25 +379,6 @@ public class Collector
         if (value == null)
             return null;
         if (int.TryParse(value.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
-            return parsed;
-        return null;
-    }
-
-    private double? ReadTelemetryTimeScalar(string variable)
-    {
-        var value = _irSdk.GetData(variable);
-        return NormalizeTime(ToDouble(value));
-    }
-
-    private static double? ToDouble(object? value)
-    {
-        if (value == null)
-            return null;
-        if (value is double d)
-            return d;
-        if (value is float f)
-            return f;
-        if (double.TryParse(value.ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed))
             return parsed;
         return null;
     }
@@ -340,7 +431,7 @@ public class Collector
             var responseObj = JsonSerializer.Deserialize<JsonElement>(responseBody);
             var accepted = responseObj.TryGetProperty("accepted", out var acceptedProp) ? acceptedProp.GetInt32() : rows.Count;
 
-            Console.WriteLine("[collector] posted {0} rows at {1}", accepted, payload.CapturedAt);
+            Console.WriteLine("[collector] posted {0} rows", accepted);
         }
         catch (Exception ex)
         {
@@ -401,4 +492,46 @@ public class DriverSnapshot
 
     [JsonPropertyName("updatedAt")]
     public string UpdatedAt { get; set; } = "";
+}
+
+// YAML models for iRSDK SessionInfoString
+public class SessionInfo
+{
+    public WeekendInfo? WeekendInfo { get; set; }
+    public DriverInfo? DriverInfo { get; set; }
+    public List<SessionData>? SessionInfo { get; set; }
+}
+
+public class WeekendInfo
+{
+    public string? TrackName { get; set; }
+    public string? TrackConfigName { get; set; }
+    public string? SeriesName { get; set; }
+    public int SubSessionID { get; set; }
+    public int SessionID { get; set; }
+}
+
+public class DriverInfo
+{
+    public int DriverCount { get; set; }
+    public List<DriverData>? Drivers { get; set; }
+}
+
+public class DriverData
+{
+    public int CarIdx { get; set; }
+    public int UserID { get; set; }
+    public string? UserName { get; set; }
+    public string? Abbrev { get; set; }
+    public string? Initials { get; set; }
+    public string? CarNumber { get; set; }
+    public int CarNumberRaw { get; set; }
+    public string? CarScreenName { get; set; }
+    public int CarClassID { get; set; }
+}
+
+public class SessionData
+{
+    public string? SessionType { get; set; }
+    public int SessionNum { get; set; }
 }
