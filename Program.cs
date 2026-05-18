@@ -298,7 +298,8 @@ public class Collector
                     await Task.Delay(TimeSpan.FromSeconds(_config.PollIntervalSeconds));
                     continue;
                 }
-                await PostRows(rows);
+                var sessionMeta = BuildSessionMeta();
+                await PostRows(rows, sessionMeta);
 
                 await Task.Delay(TimeSpan.FromSeconds(_config.PollIntervalSeconds));
             }
@@ -560,7 +561,8 @@ public class Collector
                     CarClassID = GetInt(driverNode, "CarClassID"),
                     CarClassShortName = GetString(driverNode, "CarClassShortName"),
                     CarPath = GetString(driverNode, "CarPath"),
-                    CarScreenNameShort = GetString(driverNode, "CarScreenNameShort")
+                    CarScreenNameShort = GetString(driverNode, "CarScreenNameShort"),
+                    LicString = GetString(driverNode, "LicString")
                 };
 
                 if (driver.CarIdx >= 0)
@@ -614,7 +616,8 @@ public class Collector
                     CarClassShortName = ExtractYamlString(body, "CarClassShortName"),
                     CarPath = ExtractYamlString(body, "CarPath"),
                     CarScreenNameShort = ExtractYamlString(body, "CarScreenNameShort"),
-                    CarScreenName = ExtractYamlString(body, "CarScreenName")
+                    CarScreenName = ExtractYamlString(body, "CarScreenName"),
+                    LicString = ExtractYamlString(body, "LicString")
                 };
 
                 if (driver.CarIdx >= 0)
@@ -727,6 +730,8 @@ public class Collector
         var onPitRoad = ReadIntArray("CarIdxOnPitRoad");
         var f2Times = ReadDoubleArray("CarIdxF2Time");
         var estTimes = ReadDoubleArray("CarIdxEstTime");
+        var trackSurfaces = ReadIntArray("CarIdxTrackSurface");
+        var lapDistPcts = ReadDoubleArray("CarIdxLapDistPct");
 
         if (positions == null || positions.Length == 0)
         {
@@ -824,6 +829,20 @@ public class Collector
                 lastLapValid = normalizedLastLap.HasValue;
             }
 
+            var trackSurface = trackSurfaces != null && carIdx < trackSurfaces.Length
+                ? TrackSurfaceLabel(trackSurfaces[carIdx])
+                : null;
+
+            double? lapDistPct = null;
+            if (lapDistPcts != null && carIdx < lapDistPcts.Length)
+            {
+                var rawDist = lapDistPcts[carIdx];
+                if (rawDist >= 0.0 && rawDist <= 1.0)
+                    lapDistPct = Math.Round(rawDist, 4);
+            }
+
+            var licString = driverInfo?.LicString;
+
             rows.Add(new DriverSnapshot
             {
                 SessionId = sessionId,
@@ -847,6 +866,9 @@ public class Collector
                 InPits = inPits,
                 OutLap = outLap,
                 LastPitLap = pitState.LastPitLap,
+                TrackSurface = trackSurface,
+                LapDistPct = lapDistPct,
+                LicString = licString,
                 UpdatedAt = now
             });
         }
@@ -884,6 +906,33 @@ public class Collector
         return rows;
     }
 
+    private static string? TrackSurfaceLabel(int value) => value switch
+    {
+        0 => "OffTrack",
+        1 => "InPitStall",
+        2 => "ApproachingPits",
+        3 => "OnTrack",
+        _ => null
+    };
+
+    private SessionMetaSnapshot BuildSessionMeta()
+    {
+        var sessionFlags = ReadTelemetryIntScalar("SessionFlags");
+        var sessionTimeRemain = ReadTelemetryDoubleScalar("SessionTimeRemain");
+        var sessionLapsRemain = ReadTelemetryIntScalar("SessionLapsRemain");
+        var raceLaps = ReadTelemetryIntScalar("RaceLaps");
+
+        return new SessionMetaSnapshot
+        {
+            SessionFlags = sessionFlags,
+            SessionTimeRemain = sessionTimeRemain is double d && d > 0 && d < 86400 ? Math.Round(d, 1) : null,
+            SessionLapsRemain = sessionLapsRemain,
+            RaceLaps = raceLaps,
+            TrackName = _cachedSessionInfo?.WeekendInfo?.TrackName,
+            TrackConfig = _cachedSessionInfo?.WeekendInfo?.TrackConfigName
+        };
+    }
+
     private int[]? ReadIntArray(string variable)
     {
         var value = _irSdk.GetData(variable);
@@ -913,6 +962,16 @@ public class Collector
             return null;
         if (int.TryParse(value.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
             return parsed;
+        return null;
+    }
+
+    private double? ReadTelemetryDoubleScalar(string variable)
+    {
+        var value = _irSdk.GetData(variable);
+        if (value == null) return null;
+        if (value is double d) return d;
+        if (value is float f) return (double)f;
+        if (double.TryParse(value.ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)) return parsed;
         return null;
     }
 
@@ -969,7 +1028,7 @@ public class Collector
         return null;
     }
 
-    private async Task PostRows(List<DriverSnapshot> rows)
+    private async Task PostRows(List<DriverSnapshot> rows, SessionMetaSnapshot? sessionMeta = null)
     {
         if (rows.Count == 0)
         {
@@ -981,7 +1040,8 @@ public class Collector
         {
             Source = "irsdk",
             CapturedAt = DateTime.UtcNow.ToString("O"),
-            Rows = rows
+            Rows = rows,
+            SessionMeta = sessionMeta
         };
 
         try
@@ -1166,6 +1226,30 @@ public class IngestPayload
 
     [JsonPropertyName("rows")]
     public List<DriverSnapshot> Rows { get; set; } = new();
+
+    [JsonPropertyName("sessionMeta")]
+    public SessionMetaSnapshot? SessionMeta { get; set; }
+}
+
+public class SessionMetaSnapshot
+{
+    [JsonPropertyName("sessionFlags")]
+    public int? SessionFlags { get; set; }
+
+    [JsonPropertyName("sessionTimeRemain")]
+    public double? SessionTimeRemain { get; set; }
+
+    [JsonPropertyName("sessionLapsRemain")]
+    public int? SessionLapsRemain { get; set; }
+
+    [JsonPropertyName("raceLaps")]
+    public int? RaceLaps { get; set; }
+
+    [JsonPropertyName("trackName")]
+    public string? TrackName { get; set; }
+
+    [JsonPropertyName("trackConfig")]
+    public string? TrackConfig { get; set; }
 }
 
 public class DebugRawEnvelope
@@ -1326,6 +1410,15 @@ public class DriverSnapshot
     [JsonPropertyName("lastPitLap")]
     public int? LastPitLap { get; set; }
 
+    [JsonPropertyName("trackSurface")]
+    public string? TrackSurface { get; set; }
+
+    [JsonPropertyName("lapDistPct")]
+    public double? LapDistPct { get; set; }
+
+    [JsonPropertyName("licString")]
+    public string? LicString { get; set; }
+
     [JsonPropertyName("updatedAt")]
     public string UpdatedAt { get; set; } = "";
 }
@@ -1375,6 +1468,7 @@ public class DriverData
     public int CarClassID { get; set; }
     public string? CarClassShortName { get; set; }
     public int IRating { get; set; }
+    public string? LicString { get; set; }
 }
 
 public class PitState
