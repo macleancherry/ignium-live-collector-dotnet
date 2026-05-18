@@ -558,7 +558,9 @@ public class Collector
                     TeamName = GetString(driverNode, "TeamName"),
                     IRating = GetInt(driverNode, "IRating"),
                     CarClassID = GetInt(driverNode, "CarClassID"),
-                    CarClassShortName = GetString(driverNode, "CarClassShortName")
+                    CarClassShortName = GetString(driverNode, "CarClassShortName"),
+                    CarPath = GetString(driverNode, "CarPath"),
+                    CarScreenNameShort = GetString(driverNode, "CarScreenNameShort")
                 };
 
                 if (driver.CarIdx >= 0)
@@ -609,7 +611,10 @@ public class Collector
                     CarNumber = ExtractYamlString(body, "CarNumber"),
                     IRating = ExtractYamlInt(body, "IRating") ?? 0,
                     CarClassID = ExtractYamlInt(body, "CarClassID") ?? 0,
-                    CarClassShortName = ExtractYamlString(body, "CarClassShortName")
+                    CarClassShortName = ExtractYamlString(body, "CarClassShortName"),
+                    CarPath = ExtractYamlString(body, "CarPath"),
+                    CarScreenNameShort = ExtractYamlString(body, "CarScreenNameShort"),
+                    CarScreenName = ExtractYamlString(body, "CarScreenName")
                 };
 
                 if (driver.CarIdx >= 0)
@@ -741,9 +746,11 @@ public class Collector
             int? iRating = null;
             int? classId = null;
             string? classShortName = null;
+            DriverData? driverInfo = null;
 
-            if (_driverCache.TryGetValue(carIdx, out var driverInfo))
+            if (_driverCache.TryGetValue(carIdx, out var cachedDriverInfo))
             {
+                driverInfo = cachedDriverInfo;
                 if (!string.IsNullOrWhiteSpace(driverInfo.UserName))
                     driverName = driverInfo.UserName;
                 if (!string.IsNullOrWhiteSpace(driverInfo.TeamName))
@@ -759,6 +766,8 @@ public class Collector
                 if (!string.IsNullOrWhiteSpace(driverInfo.CarClassShortName))
                     classShortName = driverInfo.CarClassShortName;
             }
+
+            classShortName = ResolveClassShortName(classId, classShortName, driverInfo);
 
             var classPosition = classPositions?[carIdx] ?? 0;
             var lap = lapsCompleted?[carIdx] ?? 0;
@@ -914,6 +923,50 @@ public class Collector
         if (value.Value <= 0 || value.Value >= 1800)
             return null;
         return Math.Round(value.Value, 3);
+    }
+
+    private static string? ResolveClassShortName(int? classId, string? classShortName, DriverData? driverInfo)
+    {
+        if (!string.IsNullOrWhiteSpace(classShortName))
+        {
+            var trimmed = classShortName.Trim();
+            if (!trimmed.StartsWith("CarClassRelSpeed", StringComparison.OrdinalIgnoreCase))
+            {
+                return trimmed;
+            }
+        }
+
+        if (classId == 4029)
+            return "GTP";
+        if (classId == 2523)
+            return "LMP2";
+        if (classId == 4011)
+            return "IMSA23";
+
+        var carPath = driverInfo?.CarPath;
+        if (!string.IsNullOrWhiteSpace(carPath))
+        {
+            var path = carPath.ToLowerInvariant();
+            if (path.Contains("gtp", StringComparison.Ordinal) || path.Contains("lmdh", StringComparison.Ordinal))
+                return "GTP";
+            if (path.Contains("p217", StringComparison.Ordinal) || path.Contains("lmp2", StringComparison.Ordinal))
+                return "LMP2";
+            if (path.Contains("gt3", StringComparison.Ordinal))
+                return "IMSA23";
+        }
+
+        var screen = driverInfo?.CarScreenNameShort ?? driverInfo?.CarScreenName;
+        if (!string.IsNullOrWhiteSpace(screen))
+        {
+            if (screen.Contains("GTP", StringComparison.OrdinalIgnoreCase) || screen.Contains("Hybrid V8", StringComparison.OrdinalIgnoreCase))
+                return "GTP";
+            if (screen.Contains("LMP2", StringComparison.OrdinalIgnoreCase))
+                return "LMP2";
+            if (screen.Contains("GT3", StringComparison.OrdinalIgnoreCase))
+                return "IMSA23";
+        }
+
+        return null;
     }
 
     private async Task PostRows(List<DriverSnapshot> rows)
@@ -1316,7 +1369,9 @@ public class DriverData
     public string? Initials { get; set; }
     public string? CarNumber { get; set; }
     public int CarNumberRaw { get; set; }
+    public string? CarPath { get; set; }
     public string? CarScreenName { get; set; }
+    public string? CarScreenNameShort { get; set; }
     public int CarClassID { get; set; }
     public string? CarClassShortName { get; set; }
     public int IRating { get; set; }
