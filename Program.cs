@@ -221,6 +221,8 @@ public class Collector
     private SessionInfo? _cachedSessionInfo;
     private string _lastSessionInfoYaml = "";
     private readonly Dictionary<int, DriverData> _driverCache = new();
+    private readonly Dictionary<int, PitState> _pitState = new();
+    private readonly Dictionary<int, BestLapState> _bestLapState = new();
 
     public Collector(Config config)
     {
@@ -248,6 +250,8 @@ public class Collector
                     _cachedSessionInfo = null;
                     _lastSessionInfoYaml = "";
                     _driverCache.Clear();
+                    _pitState.Clear();
+                    _bestLapState.Clear();
                     await Task.Delay(TimeSpan.FromSeconds(_config.PollIntervalSeconds));
                     continue;
                 }
@@ -330,7 +334,10 @@ public class Collector
 
             if (_driverCache.Count == 0)
             {
-                TryPopulateDriverCacheFromYamlTree(sanitizedYaml);
+                if (!TryPopulateDriverCacheFromYamlTree(sanitizedYaml))
+                {
+                    TryPopulateDriverCacheFromYamlText(sanitizedYaml);
+                }
             }
 
             Console.WriteLine("[collector] updated session info with {0} drivers", _driverCache.Count);
@@ -500,7 +507,11 @@ public class Collector
                     CarIdx = GetInt(driverNode, "CarIdx"),
                     UserID = GetInt(driverNode, "UserID"),
                     UserName = GetString(driverNode, "UserName"),
-                    CarNumber = GetString(driverNode, "CarNumber")
+                    CarNumber = GetString(driverNode, "CarNumber"),
+                    TeamName = GetString(driverNode, "TeamName"),
+                    IRating = GetInt(driverNode, "IRating"),
+                    CarClassID = GetInt(driverNode, "CarClassID"),
+                    CarClassShortName = GetString(driverNode, "CarClassShortName")
                 };
 
                 if (driver.CarIdx >= 0)
@@ -522,6 +533,84 @@ public class Collector
         {
             return false;
         }
+    }
+
+    private bool TryPopulateDriverCacheFromYamlText(string sessionInfoYaml)
+    {
+        try
+        {
+            var matches = Regex.Matches(
+                sessionInfoYaml,
+                @"(?ms)^\s*-\s*CarIdx:\s*(?<carIdx>-?\d+)(?<body>.*?)(?=^\s*-\s*CarIdx:|\z)");
+
+            foreach (Match match in matches)
+            {
+                if (!int.TryParse(match.Groups["carIdx"].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var carIdx))
+                {
+                    continue;
+                }
+
+                var body = match.Groups["body"].Value;
+                var userId = ExtractYamlInt(body, "UserID") ?? 0;
+
+                var driver = new DriverData
+                {
+                    CarIdx = carIdx,
+                    UserID = userId,
+                    UserName = ExtractYamlString(body, "UserName"),
+                    TeamName = ExtractYamlString(body, "TeamName"),
+                    CarNumber = ExtractYamlString(body, "CarNumber"),
+                    IRating = ExtractYamlInt(body, "IRating") ?? 0,
+                    CarClassID = ExtractYamlInt(body, "CarClassID") ?? 0,
+                    CarClassShortName = ExtractYamlString(body, "CarClassShortName")
+                };
+
+                if (driver.CarIdx >= 0)
+                {
+                    _driverCache[driver.CarIdx] = driver;
+                }
+            }
+
+            return _driverCache.Count > 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string? ExtractYamlString(string text, string key)
+    {
+        var pattern = $@"(?m)^\s*{Regex.Escape(key)}:\s*(?<value>.*)$";
+        var match = Regex.Match(text, pattern);
+        if (!match.Success)
+        {
+            return null;
+        }
+
+        var raw = match.Groups["value"].Value.Trim();
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        if ((raw.StartsWith("\"") && raw.EndsWith("\"")) || (raw.StartsWith("'") && raw.EndsWith("'")))
+        {
+            raw = raw.Substring(1, raw.Length - 2);
+        }
+
+        return raw.Replace("\\\"", "\"").Replace("\\\\", "\\");
+    }
+
+    private static int? ExtractYamlInt(string text, string key)
+    {
+        var raw = ExtractYamlString(text, key);
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        return int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value) ? value : null;
     }
 
     private static YamlMappingNode? GetMappingNode(YamlMappingNode node, string key)
@@ -583,6 +672,7 @@ public class Collector
         var lapsCompleted = ReadIntArray("CarIdxLapCompleted");
         var lastLapTimes = ReadDoubleArray("CarIdxLastLapTime");
         var bestLapTimes = ReadDoubleArray("CarIdxBestLapTime");
+        var onPitRoad = ReadIntArray("CarIdxOnPitRoad");
         var f2Times = ReadDoubleArray("CarIdxF2Time");
         var estTimes = ReadDoubleArray("CarIdxEstTime");
 
@@ -598,25 +688,85 @@ public class Collector
             if (position < 0) continue; // Car not active in session
 
             var driverName = "Unknown";
+            string? teamName = null;
             var carNumber = "";
             var customerId = carIdx + 1; // Fallback synthetic ID
+            int? iRating = null;
+            int? classId = null;
+            string? classShortName = null;
 
             if (_driverCache.TryGetValue(carIdx, out var driverInfo))
             {
                 if (!string.IsNullOrWhiteSpace(driverInfo.UserName))
                     driverName = driverInfo.UserName;
+                if (!string.IsNullOrWhiteSpace(driverInfo.TeamName))
+                    teamName = driverInfo.TeamName;
                 if (!string.IsNullOrWhiteSpace(driverInfo.CarNumber))
                     carNumber = driverInfo.CarNumber;
                 if (driverInfo.UserID > 0)
                     customerId = driverInfo.UserID;
+                if (driverInfo.IRating > 0)
+                    iRating = driverInfo.IRating;
+                if (driverInfo.CarClassID > 0)
+                    classId = driverInfo.CarClassID;
+                if (!string.IsNullOrWhiteSpace(driverInfo.CarClassShortName))
+                    classShortName = driverInfo.CarClassShortName;
             }
 
             var classPosition = classPositions?[carIdx] ?? 0;
             var lap = lapsCompleted?[carIdx] ?? 0;
             var lastLap = lastLapTimes?[carIdx];
             var bestLap = bestLapTimes?[carIdx];
-            var gap = f2Times?[carIdx]; // Time delta to leader
+            var gap = NormalizeTime(f2Times?[carIdx]);
             double? interval = null;
+
+            var inPits = (onPitRoad?[carIdx] ?? 0) > 0;
+            if (!_pitState.TryGetValue(carIdx, out var pitState))
+            {
+                pitState = new PitState();
+                _pitState[carIdx] = pitState;
+            }
+
+            if (!pitState.WasInPits && inPits)
+            {
+                pitState.LastPitLap = Math.Max(1, lap);
+            }
+
+            if (pitState.WasInPits && !inPits)
+            {
+                pitState.OutLapAtLap = Math.Max(1, lap);
+            }
+
+            var outLap = !inPits && pitState.OutLapAtLap.HasValue && lap == pitState.OutLapAtLap.Value;
+            if (pitState.OutLapAtLap.HasValue && lap > pitState.OutLapAtLap.Value)
+            {
+                pitState.OutLapAtLap = null;
+            }
+            pitState.WasInPits = inPits;
+
+            if (!_bestLapState.TryGetValue(carIdx, out var bestState))
+            {
+                bestState = new BestLapState();
+                _bestLapState[carIdx] = bestState;
+            }
+
+            var normalizedBestLap = NormalizeTime(bestLap);
+            if (normalizedBestLap.HasValue)
+            {
+                if (!bestState.BestLap.HasValue || normalizedBestLap.Value < bestState.BestLap.Value - 0.0005)
+                {
+                    bestState.BestLap = normalizedBestLap.Value;
+                    bestState.BestLapNumber = Math.Max(1, lap);
+                }
+            }
+
+            var bestLapNumber = bestState.BestLapNumber;
+            var normalizedLastLap = NormalizeTime(lastLap);
+            bool? lastLapValid = null;
+            if (lap > 1)
+            {
+                lastLapValid = normalizedLastLap.HasValue;
+            }
 
             rows.Add(new DriverSnapshot
             {
@@ -624,28 +774,54 @@ public class Collector
                 SubsessionId = subsessionId,
                 CustomerId = customerId,
                 DriverName = driverName,
+                TeamName = teamName,
                 CarNumber = carNumber,
                 Position = Math.Max(0, position),
                 ClassPosition = Math.Max(0, classPosition),
+                ClassId = classId,
+                ClassShortName = classShortName,
+                IRating = iRating,
                 Lap = Math.Max(0, lap),
-                LastLap = NormalizeTime(lastLap),
-                BestLap = NormalizeTime(bestLap),
-                Gap = NormalizeTime(gap),
+                LastLap = normalizedLastLap,
+                LastLapValid = lastLapValid,
+                BestLap = normalizedBestLap,
+                BestLapNumber = bestLapNumber,
+                Gap = gap,
                 Interval = interval,
+                InPits = inPits,
+                OutLap = outLap,
+                LastPitLap = pitState.LastPitLap,
                 UpdatedAt = now
             });
         }
 
-        // Compute intervals (gap to car ahead in same class)
-        for (int i = 1; i < rows.Count; i++)
+        // Compute interval as time delta to car ahead in class using gap-to-leader values.
+        foreach (var classGroup in rows
+            .Where(r => r.ClassPosition > 0)
+            .GroupBy(r => r.ClassId ?? -1))
         {
-            var current = rows[i];
-            var ahead = rows.FirstOrDefault(r => r.ClassPosition == current.ClassPosition - 1);
-            if (ahead != null && ahead.LastLap.HasValue && current.LastLap.HasValue)
+            var ordered = classGroup.OrderBy(r => r.ClassPosition).ThenBy(r => r.Position).ToList();
+            for (int i = 1; i < ordered.Count; i++)
             {
-                // Simple interval: difference in last lap times
-                var delta = current.LastLap.Value - ahead.LastLap.Value;
-                current.Interval = NormalizeTime(delta);
+                var current = ordered[i];
+                var ahead = ordered[i - 1];
+                if (current.Gap.HasValue && ahead.Gap.HasValue)
+                {
+                    current.Interval = NormalizeTime(current.Gap.Value - ahead.Gap.Value);
+                }
+                else
+                {
+                    var currentEst = estTimes != null && current.Position > 0 && current.Position - 1 < estTimes.Length
+                        ? NormalizeTime(estTimes[current.Position - 1])
+                        : null;
+                    var aheadEst = estTimes != null && ahead.Position > 0 && ahead.Position - 1 < estTimes.Length
+                        ? NormalizeTime(estTimes[ahead.Position - 1])
+                        : null;
+                    if (currentEst.HasValue && aheadEst.HasValue)
+                    {
+                        current.Interval = NormalizeTime(currentEst.Value - aheadEst.Value);
+                    }
+                }
             }
         }
 
@@ -999,6 +1175,9 @@ public class DriverSnapshot
     [JsonPropertyName("driverName")]
     public string DriverName { get; set; } = "";
 
+    [JsonPropertyName("teamName")]
+    public string? TeamName { get; set; }
+
     [JsonPropertyName("carNumber")]
     public string CarNumber { get; set; } = "";
 
@@ -1008,20 +1187,44 @@ public class DriverSnapshot
     [JsonPropertyName("classPosition")]
     public int ClassPosition { get; set; }
 
+    [JsonPropertyName("classId")]
+    public int? ClassId { get; set; }
+
+    [JsonPropertyName("classShortName")]
+    public string? ClassShortName { get; set; }
+
+    [JsonPropertyName("iRating")]
+    public int? IRating { get; set; }
+
     [JsonPropertyName("lap")]
     public int Lap { get; set; }
 
     [JsonPropertyName("lastLap")]
     public double? LastLap { get; set; }
 
+    [JsonPropertyName("lastLapValid")]
+    public bool? LastLapValid { get; set; }
+
     [JsonPropertyName("bestLap")]
     public double? BestLap { get; set; }
+
+    [JsonPropertyName("bestLapNumber")]
+    public int? BestLapNumber { get; set; }
 
     [JsonPropertyName("interval")]
     public double? Interval { get; set; }
 
     [JsonPropertyName("gap")]
     public double? Gap { get; set; }
+
+    [JsonPropertyName("inPits")]
+    public bool InPits { get; set; }
+
+    [JsonPropertyName("outLap")]
+    public bool OutLap { get; set; }
+
+    [JsonPropertyName("lastPitLap")]
+    public int? LastPitLap { get; set; }
 
     [JsonPropertyName("updatedAt")]
     public string UpdatedAt { get; set; } = "";
@@ -1060,12 +1263,29 @@ public class DriverData
     public int CarIdx { get; set; }
     public int UserID { get; set; }
     public string? UserName { get; set; }
+    public string? TeamName { get; set; }
     public string? Abbrev { get; set; }
+    public string? AbbrevName { get; set; }
     public string? Initials { get; set; }
     public string? CarNumber { get; set; }
     public int CarNumberRaw { get; set; }
     public string? CarScreenName { get; set; }
     public int CarClassID { get; set; }
+    public string? CarClassShortName { get; set; }
+    public int IRating { get; set; }
+}
+
+public class PitState
+{
+    public bool WasInPits { get; set; }
+    public int? LastPitLap { get; set; }
+    public int? OutLapAtLap { get; set; }
+}
+
+public class BestLapState
+{
+    public double? BestLap { get; set; }
+    public int? BestLapNumber { get; set; }
 }
 
 public class SessionData
