@@ -8,7 +8,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>IgniumLiveCollector</AssemblyName>
     <RootNamespace>IgniumLiveCollector</RootNamespace>
-    <Version>1.0.0</Version>
+    <Version>1.0.1</Version>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
