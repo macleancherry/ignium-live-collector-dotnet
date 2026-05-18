@@ -56,6 +56,19 @@ public static class ConfigBootstrap
 
         if (!string.IsNullOrWhiteSpace(ingestUrl) && !string.IsNullOrWhiteSpace(ingestToken))
         {
+            if (debugRawEnabled && ShouldDisableDebugNow())
+            {
+                debugRawEnabled = false;
+                map["DEBUG_RAW_ENABLED"] = "false";
+                map["LIVE_API_INGEST_URL"] = ingestUrl;
+                map["LIVE_API_INGEST_TOKEN"] = ingestToken;
+                map["LIVE_API_DEBUG_RAW_URL"] = debugRawUrl ?? "";
+                map["POLL_INTERVAL_SECONDS"] = poll.ToString(CultureInfo.InvariantCulture);
+                map["REQUEST_TIMEOUT_SECONDS"] = timeout.ToString(CultureInfo.InvariantCulture);
+                SaveEnvMap(envPath, map);
+                Console.WriteLine("[setup] DEBUG_RAW_ENABLED was set to false for subsequent runs.");
+            }
+
             return new Config
             {
                 IngestUrl = ingestUrl,
@@ -161,6 +174,23 @@ public static class ConfigBootstrap
         }
 
         return fallback;
+    }
+
+    private static bool ShouldDisableDebugNow()
+    {
+        Console.Write("[setup] DEBUG_RAW_ENABLED is currently true. Disable debug mode? (Y/n): ");
+        var input = Console.ReadLine()?.Trim();
+        return string.IsNullOrWhiteSpace(input) || string.Equals(input, "y", StringComparison.OrdinalIgnoreCase) || string.Equals(input, "yes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void SaveEnvMap(string path, Dictionary<string, string> map)
+    {
+        var lines = map
+            .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(kv => $"{kv.Key}={kv.Value}")
+            .ToArray();
+
+        File.WriteAllLines(path, lines, Encoding.ASCII);
     }
 
     private static bool ParseBool(Dictionary<string, string> map, string key, bool fallback)
@@ -302,15 +332,24 @@ public class Collector
 
             var sanitizedYaml = SanitizeSessionInfoYaml(sessionInfoYaml);
 
-            _cachedSessionInfo = _yamlDeserializer.Deserialize<SessionInfo>(sanitizedYaml);
-            if (_cachedSessionInfo?.DriverInfo?.Drivers == null || _cachedSessionInfo.DriverInfo.Drivers.Count == 0)
+            var parseExceptionMessage = string.Empty;
+            _cachedSessionInfo = null;
+            try
             {
-                // Some SDK payloads are wrapped in a top-level SessionInfo node.
-                var wrapped = _yamlDeserializer.Deserialize<SessionInfoEnvelope>(sanitizedYaml);
-                if (wrapped?.SessionInfo != null)
+                _cachedSessionInfo = _yamlDeserializer.Deserialize<SessionInfo>(sanitizedYaml);
+                if (_cachedSessionInfo?.DriverInfo?.Drivers == null || _cachedSessionInfo.DriverInfo.Drivers.Count == 0)
                 {
-                    _cachedSessionInfo = wrapped.SessionInfo;
+                    // Some SDK payloads are wrapped in a top-level SessionInfo node.
+                    var wrapped = _yamlDeserializer.Deserialize<SessionInfoEnvelope>(sanitizedYaml);
+                    if (wrapped?.SessionInfo != null)
+                    {
+                        _cachedSessionInfo = wrapped.SessionInfo;
+                    }
                 }
+            }
+            catch (Exception ex)
+            {
+                parseExceptionMessage = ex.Message;
             }
 
             _driverCache.Clear();
@@ -334,10 +373,18 @@ public class Collector
 
             if (_driverCache.Count == 0)
             {
-                if (!TryPopulateDriverCacheFromYamlTree(sanitizedYaml))
+                if (!TryPopulateDriverCacheFromYamlTree(sanitizedYaml) && !TryPopulateDriverCacheFromYamlTree(sessionInfoYaml))
                 {
-                    TryPopulateDriverCacheFromYamlText(sanitizedYaml);
+                    if (!TryPopulateDriverCacheFromYamlText(sanitizedYaml))
+                    {
+                        TryPopulateDriverCacheFromYamlText(sessionInfoYaml);
+                    }
                 }
+            }
+
+            if (!string.IsNullOrWhiteSpace(parseExceptionMessage))
+            {
+                Console.WriteLine("[collector] warning: failed to parse SessionInfoString: {0}", parseExceptionMessage);
             }
 
             Console.WriteLine("[collector] updated session info with {0} drivers", _driverCache.Count);
